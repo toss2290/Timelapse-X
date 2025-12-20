@@ -1,0 +1,705 @@
+"""
+Main UI panel for Timelapse X addon.
+
+FIXED: All StateManager accesses now use instance: StateManager()
+- Changed StateManager.X to StateManager().X throughout
+- Fixes "TypeError: stat: path should be string, bytes, os.PathLike or integer, not property"
+"""
+
+import bpy
+import os
+import time
+import logging
+from datetime import datetime
+from bpy.types import Panel
+
+from .. import constants
+from .. import utils
+from ..state_manager import StateManager  # ✅ Direct import
+from .. import progress
+
+logger = logging.getLogger(__name__)
+
+
+class TLX_PT_panel(Panel):
+    """Main panel for Timelapse X addon."""
+    
+    bl_label = 'Timelapse X'
+    bl_idname = 'TLX_PT_panel'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Timelapse X'
+    
+    def draw(self, context):
+        """Draw the main panel UI."""
+        layout = self.layout
+        scene = context.scene
+        prefs = utils.get_addon_preferences()
+        
+        # ✅ DEBUG: State validation
+        self._validate_state_consistency(layout, scene)
+        
+        # Output folder section
+        self._draw_output_folder(layout, prefs)
+        
+        # Capture mode
+        self._draw_capture_mode(layout, scene)
+        
+        # Interval settings
+        self._draw_interval_settings(layout, scene, prefs)
+        
+        # Camera list (if in Camera List mode)
+        if scene.tlx_capture_mode == 'CAMERA_LIST':
+            self._draw_camera_list(layout, scene, prefs)
+        
+        # Recording controls
+        self._draw_recording_controls(layout, scene)
+        
+        # ✅ FIX: Use instance
+        if StateManager().recording:
+            layout.separator()
+            self._draw_recording_progress(layout, context)
+        
+        # Session info
+        self._draw_session_info(layout, prefs)
+        
+        # Video compilation
+        self._draw_video_tools(layout, scene, prefs)
+        
+        # Clean Window tools
+        self._draw_clean_window(layout, context, prefs)
+        
+        # Quick Settings
+        if prefs:
+            self._draw_quick_settings(layout, scene, prefs)
+        
+        # ✅ NEW: Debug panel (always at bottom)
+        if prefs and getattr(prefs, 'show_debug_panel', False):
+            self._draw_debug_panel(layout, context)
+    
+    def _draw_output_folder(self, layout, prefs):
+        """Draw output folder section."""
+        if not prefs:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Preferences not found!", icon='ERROR')
+            return
+        
+        box = layout.box()
+        box.label(text='Output Images Folder', icon='FILE')
+        box.prop(prefs, 'output_dir', text='')
+        
+        row = box.row(align=True)
+        row.operator('tlx.open_images_folder', text='Open', icon='FILE')
+        row.operator('tlx.clean_empty_folders', text='Clean', icon='BRUSH_DATA')
+    
+    def _validate_state_consistency(self, layout, scene):
+        """Validate and fix state inconsistencies."""
+        mgr = StateManager()
+        
+        # Check for stuck recording state
+        is_stuck = (
+            mgr.recording and  # Says recording
+            (not mgr.timer or not mgr.session_dir)  # But no timer/session
+        )
+        
+        if is_stuck:
+            # Show warning
+            box = layout.box()
+            box.alert = True
+            col = box.column(align=True)
+            col.label(text="⚠ STUCK RECORDING STATE DETECTED", icon='ERROR')
+            col.label(text="Recording flag is ON but no session active")
+            col.separator()
+            
+            # Show debug info
+            col.label(text=f"• recording={mgr.recording}")
+            col.label(text=f"• timer={mgr.timer is not None}")
+            col.label(text=f"• session_dir={bool(mgr.session_dir)}")
+            col.label(text=f"• scene.tlx_is_recording={scene.tlx_is_recording}")
+            
+            col.separator()
+            
+            # Force reset button
+            col.operator('tlx.force_reset_state', text='Force Reset State', icon='FILE_REFRESH')
+            
+            layout.separator()
+    
+    def _draw_output_folder(self, layout, prefs):
+        """Draw output folder section."""
+        if not prefs:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Preferences not found!", icon='ERROR')
+            return
+        
+        box = layout.box()
+        box.label(text='Output Images Folder', icon='FILE')
+        box.prop(prefs, 'output_dir', text='')
+        
+        row = box.row(align=True)
+        row.operator('tlx.open_images_folder', text='Open', icon='FILE')
+        row.operator('tlx.clean_empty_folders', text='Clean', icon='BRUSH_DATA')
+    
+    def _draw_capture_mode(self, layout, scene):
+        """Draw capture mode selection."""
+        box = layout.box()
+        row = box.row()
+        row.prop(scene, 'tlx_capture_mode', expand=True)
+    
+    def _draw_interval_settings(self, layout, scene, prefs):
+        """Draw interval configuration."""
+        box = layout.box()
+        
+        # Interval input
+        row = box.row(align=True)
+        row.prop(scene, 'tlx_capture_interval', text='Interval (s)')
+        row.operator('tlx.update_interval', text='', icon='CHECKMARK')
+        
+        # Quick presets
+        row = box.row(align=True)
+        for value in (0.5, 1.0, 2.0, 5.0):
+            op = row.operator('tlx.set_interval', text=f'{value:.1f}s')
+            op.value = value
+    
+    def _draw_camera_list(self, layout, scene, prefs):
+        """Draw camera list section."""
+        box = layout.box()
+        
+        # Header
+        header = box.row(align=True)
+        icon = 'TRIA_RIGHT' if scene.tlx_ui_cam_editor_collapsed else 'TRIA_DOWN'
+        header.prop(scene, 'tlx_ui_cam_editor_collapsed', text='', icon=icon, emboss=False)
+        header.label(text="Camera Settings")
+        
+        if not scene.tlx_ui_cam_editor_collapsed:
+            # Camera list
+            row = box.row()
+            row.template_list(
+                'TLX_UL_cameras',
+                '',
+                scene,
+                'tlx_cameras',
+                scene,
+                'tlx_cameras_index',
+                rows=4
+            )
+            
+            # Add/Remove buttons
+            col = row.column(align=True)
+            col.enabled = not scene.tlx_is_recording
+            col.operator('tlx.cam_add', text='', icon='ADD')
+            col.operator('tlx.cam_remove', text='', icon='REMOVE')
+            col.separator()
+            col.operator('tlx.cam_move_up', text='', icon='TRIA_UP')
+            col.operator('tlx.cam_move_down', text='', icon='TRIA_DOWN')
+            
+            # Camera editor
+            if 0 <= scene.tlx_cameras_index < len(scene.tlx_cameras):
+                self._draw_camera_editor(box, scene.tlx_cameras[scene.tlx_cameras_index])
+            
+            # Speed preset
+            box.separator()
+            box.operator('tlx.apply_speed_preset', text='Apply Speed Preset', icon='PREFERENCES')
+    
+    def _draw_camera_editor(self, layout, camera_item):
+        """Draw per-camera settings editor."""
+        if not camera_item or not camera_item.camera:
+            return
+        
+        editor = layout.box()
+        editor.label(text=f"Camera: {camera_item.camera.name}", icon='CAMERA_DATA')
+        
+        # Interval override
+        editor.prop(camera_item, 'use_interval_override')
+        col = editor.column(align=True)
+        col.enabled = camera_item.use_interval_override
+        col.prop(camera_item, 'interval_override', slider=True)
+        
+        editor.separator()
+        
+        # Shading override
+        editor.prop(camera_item, 'use_shading_override')
+        col = editor.column(align=True)
+        col.enabled = camera_item.use_shading_override
+        col.prop(camera_item, 'shading_type')
+        col.prop(camera_item, 'xray')
+        col.prop(camera_item, 'disable_shadows')
+        
+        editor.separator()
+        
+        # Image format override
+        editor.prop(camera_item, 'use_image_override')
+        col = editor.column(align=True)
+        col.enabled = camera_item.use_image_override
+        col.prop(camera_item, 'image_format')
+        if camera_item.image_format == 'PNG':
+            col.prop(camera_item, 'png_rgba')
+        else:
+            col.prop(camera_item, 'jpeg_quality')
+    
+    def _draw_recording_controls(self, layout, scene):
+        """Draw start/stop/pause controls."""
+        box = layout.box()
+        
+        row = box.row(align=True)
+        
+        if not scene.tlx_is_recording:
+            op = row.operator('tlx.record', text='Start Recording', icon='PLAY')
+            op.start = True
+            op.interval = 0.0
+            op.mode = 'DEFAULT'
+        else:
+            # ✅ FIX: Use instance
+            paused = StateManager().paused
+            pause_text = 'Resume' if paused else 'Pause'
+            pause_icon = 'PLAY' if paused else 'PAUSE'
+            row.operator('tlx.pause_resume', text=pause_text, icon=pause_icon)
+            
+            op = row.operator('tlx.record', text='Stop', icon='SNAP_FACE')
+            op.start = False
+    
+    def _draw_recording_progress(self, layout, context):
+        """Draw recording progress display."""
+        box = layout.box()
+        box.label(text="Recording Progress", icon='TIME')
+        
+        # Get progress tracker
+        rec_progress = progress.get_recording_progress()
+        
+        col = box.column(align=True)
+        
+        if rec_progress.frame_count > 0:
+            # Frame count
+            row = col.row()
+            row.label(text="", icon='IMAGE_DATA')
+            row.label(text="Frames:")
+            row.label(text=str(rec_progress.frame_count))
+            
+            # Duration
+            elapsed = time.time() - rec_progress.start_time
+            if elapsed < 60:
+                duration_str = f"{elapsed:.0f}s"
+            elif elapsed < 3600:
+                duration_str = f"{elapsed/60:.1f}m"
+            else:
+                duration_str = f"{elapsed/3600:.1f}h"
+            
+            row = col.row()
+            row.label(text="", icon='TIME')
+            row.label(text="Duration:")
+            row.label(text=duration_str)
+            
+            # Size
+            if rec_progress.session_size_bytes > 0:
+                size_mb = rec_progress.session_size_bytes / (1024 * 1024)
+                row = col.row()
+                row.label(text="", icon='DISK_DRIVE')
+                row.label(text="Size:")
+                row.label(text=f"{size_mb:.1f} MB")
+            
+            # Capture rate (only show after 10 seconds)
+            if elapsed > 10:
+                fps = rec_progress.frame_count / elapsed
+                row = col.row()
+                row.label(text="", icon='CURVE_DATA')
+                row.label(text="Rate:")
+                row.label(text=f"{fps:.2f} fps")
+            
+            # ✅ FIX: Use instance
+            session_dir = StateManager().session_dir
+            if session_dir and os.path.isdir(session_dir):
+                col.separator()
+                col.operator('tlx.open_session_folder', text='Open Session Folder', icon='FOLDER_REDIRECT')
+        
+        else:
+            col.label(text="Waiting for first capture...", icon='INFO')
+        
+        # ✅ FIX: Use instance for status
+        col.separator()
+        status_row = col.row()
+        if StateManager().paused:
+            status_row.label(text="STATUS: PAUSED", icon='PAUSE')
+        else:
+            mode_name = StateManager().capture_mode.replace('_', ' ').title()
+            status_row.label(text=f"STATUS: RECORDING ({mode_name})", icon='REC')
+    
+    def _draw_session_info(self, layout, prefs):
+        """Draw session information."""
+        box = layout.box()
+        box.label(text="Session Info", icon='INFO')
+        
+        # ✅ FIX: Use instance
+        mgr = StateManager()
+        
+        row = box.row()
+        row.label(text=f'Frames: {mgr.counter}')
+        
+        # Recording status
+        if mgr.recording:
+            status = "PAUSED" if mgr.paused else "RECORDING"
+            row.label(text=status, icon='REC' if not mgr.paused else 'PAUSE')
+        
+        # Last capture time
+        if mgr.last_capture_time:
+            try:
+                time_str = datetime.fromtimestamp(
+                    mgr.last_capture_time
+                ).strftime("%H:%M:%S")
+                box.label(text=f'Last capture: {time_str}')
+            except:
+                pass
+        
+        # ✅ FIX: Use instance for session_dir
+        session_dir = mgr.session_dir
+        if session_dir and os.path.isdir(session_dir):
+            try:
+                count, size = self._count_session_stats(session_dir)
+                if count > 0:
+                    size_str = self._format_bytes(size)
+                    box.label(text=f"Total: {count} images, {size_str}")
+            except:
+                pass
+    
+    def _draw_video_tools(self, layout, scene, prefs):
+        """Draw video compilation tools."""
+        box = layout.box()
+        
+        # Header
+        header = box.row(align=True)
+        collapsed = prefs.ui_quick_settings_collapsed if prefs else False
+        icon = 'TRIA_RIGHT' if collapsed else 'TRIA_DOWN'
+        
+        if prefs:
+            header.prop(prefs, 'ui_quick_settings_collapsed', text='', icon=icon, emboss=False)
+        
+        header.label(text="Video Tools", icon='FILE_MOVIE')
+        
+        if not (prefs and collapsed):
+            # Compile current session
+            col = box.column(align=True)
+            
+            # ✅ FIX: Use instance
+            session_dir = StateManager().session_dir
+            session_active = bool(session_dir and os.path.isdir(session_dir))
+            
+            row = col.row()
+            row.enabled = session_active
+            row.operator('tlx.compile_session_all', text='Compile Current Session', icon='RENDER_ANIMATION')
+            
+            if not session_active:
+                col.label(text="No active session", icon='INFO')
+            
+            col.separator()
+            
+            # Manual compilation
+            col.operator('tlx.compile_video', text='Compile from Folder...', icon='FILEBROWSER')
+            
+            # MP4 output settings
+            if prefs:
+                col.separator()
+                col.label(text="MP4 Output:")
+                col.prop(prefs, 'mp4_output_mode', text='')
+                
+                if prefs.mp4_output_mode == 'CUSTOM_DIR':
+                    col.prop(prefs, 'mp4_custom_dir', text='')
+                
+                col.operator('tlx.open_mp4_folder', text='Open MP4 Folder', icon='FILE_FOLDER')
+    
+    def _draw_clean_window(self, layout, context, prefs):
+        """Draw clean window tools."""
+        if not prefs:
+            return
+        
+        box = layout.box()
+        
+        # Header
+        header = box.row(align=True)
+        collapsed = prefs.ui_clean_window_collapsed
+        icon = 'TRIA_RIGHT' if collapsed else 'TRIA_DOWN'
+        header.prop(prefs, 'ui_clean_window_collapsed', text='', icon=icon, emboss=False)
+        header.label(text="Clean Window Tools", icon='WINDOW')
+        
+        if not collapsed:
+            wm = context.window_manager
+            
+            # Find tracked windows
+            try:
+                from ..clean_window.operators import find_tracked_windows
+                original_w, new_w = find_tracked_windows(wm)
+                is_active = original_w is not None
+                has_new_window = new_w is not None
+            except:
+                is_active = False
+                has_new_window = False
+            
+            # Toggle button
+            col = box.column(align=True)
+            
+            if has_new_window:
+                col.operator('cmw.toggle_clean_window', 
+                           text='Turn OFF (Close Window)', 
+                           icon='CANCEL')
+                
+                if is_active:
+                    col.operator('cmw.restore_original_window', 
+                               text='Restore Original Only', 
+                               icon='RECOVER_LAST')
+            else:
+                col.operator('cmw.toggle_clean_window', 
+                           text='Create Clean Window', 
+                           icon='WINDOW')
+            
+            # Settings
+            box_settings = box.box()
+            box_settings.label(text="Settings:")
+            
+            row = box_settings.row(align=True)
+            row.prop(wm, 'cmw_hide_ui', text='Hide UI')
+            row.prop(wm, 'cmw_hide_overlays', text='Overlays')
+            
+            row = box_settings.row(align=True)
+            row.prop(wm, 'cmw_hide_gizmos', text='Gizmos')
+            row.prop(wm, 'cmw_fullscreen', text='Fullscreen')
+            
+            box_settings.prop(wm, 'cmw_maximize_area')
+            box_settings.prop(wm, 'cmw_shading')
+            
+            row = box_settings.row()
+            row.enabled = not wm.cmw_hide_overlays
+            row.prop(wm, 'cmw_deep_clean')
+            
+            # Wireframe tools
+            box.separator()
+            box.label(text="Wireframe Display:", icon='MOD_WIREFRAME')
+            
+            col = box.column(align=True)
+            col.operator('cmw.enable_wireframe', icon='CHECKBOX_HLT')
+            col.operator('cmw.disable_wireframe', icon='CHECKBOX_DEHLT')
+            col.operator('cmw.toggle_wireframe', icon='MOD_WIREFRAME')
+            
+            if context.selected_objects:
+                enabled_count = sum(1 for obj in context.selected_objects if obj.show_wire)
+                box.label(text=f"Selected: {len(context.selected_objects)} | "
+                             f"Wireframe: {enabled_count}")
+    
+    def _draw_quick_settings(self, layout, scene, prefs):
+        """Draw quick settings panel."""
+        box = layout.box()
+        
+        # Header
+        header = box.row(align=True)
+        collapsed = prefs.ui_quick_settings_collapsed
+        icon = 'TRIA_RIGHT' if collapsed else 'TRIA_DOWN'
+        header.prop(prefs, 'ui_quick_settings_collapsed', text='', icon=icon, emboss=False)
+        header.label(text="Quick Settings", icon='SETTINGS')
+        
+        if not collapsed:
+            mode = scene.tlx_capture_mode
+            
+            # Common settings
+            col = box.column(align=True)
+            col.prop(prefs, 'capture_immediate_on_start')
+            col.prop(prefs, 'perf_depsgraph_suppress_ms')
+            
+            box.separator()
+            
+            # Mode-specific settings
+            if mode == 'WINDOW':
+                box.label(text="Window Capture:", icon='WINDOW')
+                col = box.column(align=True)
+                col.prop(prefs, 'window_capture_on_input_only')
+                col.prop(prefs, 'window_idle_diff')
+                
+                if prefs.window_idle_diff:
+                    row = col.row(align=True)
+                    row.prop(prefs, 'window_idle_threshold')
+                    row.prop(prefs, 'window_idle_downscale')
+                
+                col.prop(prefs, 'window_capture_scope')
+                col.prop(prefs, 'window_stabilize_view')
+                
+                box.separator()
+                box.label(text="Viewport Lock:", icon='LOCKED')
+                col = box.column(align=True)
+                col.prop(prefs, 'lock_shading')
+                
+                if prefs.lock_shading:
+                    sub = col.column(align=True)
+                    sub.prop(prefs, 'shading_type')
+                    sub.prop(prefs, 'xray')
+                    sub.prop(prefs, 'disable_shadows')
+            
+            else:  # CAMERA_LIST
+                box.label(text="Camera List:", icon='CAMERA_DATA')
+                col = box.column(align=True)
+                col.prop(prefs, 'idle_detection')
+                col.prop(prefs, 'camera_round_robin')
+                col.prop(prefs, 'camera_max_per_tick')
+                col.prop(prefs, 'camera_lock_interface')
+                col.prop(prefs, 'camera_low_overhead')
+                
+                box.separator()
+                
+                # Wireframe rendering section
+                wf_box = box.box()
+                wf_box.label(text="Wireframe Rendering:", icon='MOD_WIREFRAME')
+                
+                col = wf_box.column(align=True)
+                
+                # Line settings
+                col.label(text="Line Settings:")
+                row = col.row(align=True)
+                row.prop(prefs, 'wireframe_color', text="")
+                row.prop(prefs, 'wireframe_thickness', text="Thickness")
+                
+                col.separator()
+                
+                # Background settings
+                col.label(text="Background Settings:")
+                col.prop(prefs, 'wireframe_transparent_bg', text="Transparent Background")
+                
+                # Only show color/strength if not transparent
+                if not prefs.wireframe_transparent_bg:
+                    sub = col.column(align=True)
+                    row = sub.row(align=True)
+                    row.prop(prefs, 'wireframe_bg_color', text="")
+                    row.prop(prefs, 'wireframe_bg_strength', text="Brightness", slider=True)
+                
+                col.separator()
+                
+                # Object Color Settings
+                col.label(text="Object Color Settings:")
+                col.prop(prefs, 'wireframe_use_object_colors', text="Use Object Viewport Colors")
+                
+                if not prefs.wireframe_use_object_colors:
+                    row = col.row(align=True)
+                    row.label(text="Default Color:")
+                    row.prop(prefs, 'wireframe_default_object_color', text="")
+                
+                col.separator()
+                
+                # Render settings
+                col.label(text="Render Settings:")
+                col.prop(prefs, 'wireframe_disable_shadows', text="Disable Shadows")
+                col.prop(prefs, 'wireframe_render_engine', text="Engine")
+                
+                # Color preview (mini)
+                if not prefs.wireframe_transparent_bg:
+                    wf_box.separator()
+                    preview_row = wf_box.row(align=True)
+                    preview_row.scale_y = 0.8
+                    preview_row.label(text="Preview:", icon='COLOR')
+                    
+                    # Background preview
+                    bg_prev = preview_row.row(align=True)
+                    bg_prev.enabled = False
+                    bg_prev.scale_x = 0.5
+                    bg_prev.prop(prefs, 'wireframe_bg_color', text="")
+                    
+                    # Line preview  
+                    line_prev = preview_row.row(align=True)
+                    line_prev.enabled = False
+                    line_prev.scale_x = 0.5
+                    line_prev.prop(prefs, 'wireframe_color', text="")
+    
+    def _count_session_stats(self, directory: str):
+        """Count images and size in session directory."""
+        if not directory or not os.path.isdir(directory):
+            return 0, 0
+        
+        count = 0
+        total_size = 0
+        
+        try:
+            for root, dirs, files in os.walk(directory):
+                for filename in files:
+                    if filename.lower().endswith(constants.IMAGE_EXTENSIONS):
+                        count += 1
+                        try:
+                            filepath = os.path.join(root, filename)
+                            total_size += os.path.getsize(filepath)
+                        except OSError:
+                            pass
+        except (OSError, PermissionError):
+            pass
+        
+        return count, total_size
+    
+    def _format_bytes(self, size_bytes: int) -> str:
+        """Format byte size into human-readable string."""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} PB"
+    
+    def _draw_debug_panel(self, layout, context):
+        """Draw debug information panel."""
+        box = layout.box()
+        box.label(text="Debug Info", icon='CONSOLE')
+        
+        mgr = StateManager()
+        scene = context.scene
+        
+        col = box.column(align=True)
+        
+        # Core state
+        row = col.row()
+        row.label(text="Recording:")
+        row.label(text=str(mgr.recording))
+        
+        row = col.row()
+        row.label(text="Scene Flag:")
+        row.label(text=str(scene.tlx_is_recording))
+        
+        row = col.row()
+        row.label(text="Timer:")
+        row.label(text="Yes" if mgr.timer else "No")
+        
+        row = col.row()
+        row.label(text="Session:")
+        row.label(text="Yes" if mgr.session_dir else "No")
+        
+        # Buttons
+        col.separator()
+        col.operator('tlx.show_debug_state', text='Show Full State', icon='CONSOLE')
+        
+        # Check for stuck state
+        is_stuck = mgr.recording and (not mgr.timer or not mgr.session_dir)
+        if is_stuck:
+            col.separator()
+            col.alert = True
+            col.operator('tlx.force_reset_state', text='Force Reset', icon='FILE_REFRESH')
+
+
+# ========================================================================================
+# Registration
+# ========================================================================================
+
+classes = (
+    TLX_PT_panel,
+)
+
+
+def register():
+    """Register panel classes."""
+    logger.info("Registering UI panels (FIXED: StateManager instance access)")
+    
+    for cls in classes:
+        try:
+            bpy.utils.register_class(cls)
+            logger.info(f"Panel registered: {cls.__name__}")
+        except Exception as e:
+            logger.error(f"Failed to register {cls.__name__}: {e}")
+
+
+def unregister():
+    """Unregister panel classes."""
+    logger.info("Unregistering UI panels")
+    
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as e:
+            logger.warning(f"Failed to unregister {cls.__name__}: {e}")
